@@ -183,7 +183,7 @@ DARK_TEMPLATE = """
             position: absolute;
             width: 150%; height: 150%;
             background: conic-gradient(transparent, #00AEEF, transparent, transparent);
-            animation: rotate-border 4s linear infinite;
+            animation: rotate-border 5s linear infinite;
             z-index: -2;
         }
         .card::after, .sum-box::after {
@@ -208,12 +208,12 @@ DARK_TEMPLATE = """
         .up-dn-labels { display: flex; justify-content: center; gap: 50px; font-weight: bold; color: #8b949e; margin-bottom: 8px; }
         .box-container { display: flex; gap: 15px; }
         .stat-box { width: 110px; height: 110px; line-height: 110px; font-size: 36px; font-weight: bold; border: 3px solid #000; border-radius: 10px; }
-        .bg-up { background-color: #2ea043; color: white; } .bg-dn { background-color: #da3633; color: white; }
+        .bg-up { background-color: #2ea043; color: white; } .bg-dn { background-color: #ff0000; color: white; }
         
         .summary-wrap { display: flex; justify-content: center; gap: 30px; }
         .sum-box { width: 380px; height: 240px; flex-direction: column; }
         .sum-val { font-size: 70px; font-weight: bold; color: #2ea043; position: relative; z-index: 2; }
-        .sum-alert { font-size: 70px; font-weight: bold; color: #fff; background: #da3633; border-radius: 12px; padding: 10px 40px; display: inline-block; position: relative; z-index: 2; }
+        .sum-alert { font-size: 70px; font-weight: bold; color: #fff; background: #ff0000; border-radius: 12px; padding: 10px 40px; display: inline-block; position: relative; z-index: 2; }
         .sum-label { color: #8b949e; font-size: 22px; font-weight: bold; margin-top: 10px; position: relative; z-index: 2; }
 
         /* --- New Single AP Flasher Box --- */
@@ -222,7 +222,7 @@ DARK_TEMPLATE = """
             width: 70%;
             height: 40px;
             background: #ff0000; 
-            border: 6px solid #00FFFF; 
+            border: 5px solid #00FFFF; 
             border-radius: 6px;
             display: flex;
             align-items: center;
@@ -269,26 +269,14 @@ DARK_TEMPLATE = """
                 let currentIndex = 0;
 
                 function rotateAP() {
-                    // 1. Remove the flash class to reset the animation
                     alertTextElement.classList.remove('flash-effect');
-                    
-                    // 2. Trigger a browser reflow so the animation restarts
-                    void alertTextElement.offsetWidth; 
-                    
-                    // 3. Update the text to the current AP
+                    void alertTextElement.offsetWidth; // Reflow
                     alertTextElement.innerText = "⚠️ " + downAps[currentIndex];
-                    
-                    // 4. Re-add the flash class
                     alertTextElement.classList.add('flash-effect');
-                    
-                    // 5. Move to the next index, loop back to 0 if at the end
                     currentIndex = (currentIndex + 1) % downAps.length;
                 }
 
-                // Run immediately for the first AP
                 rotateAP();
-                
-                // Then repeat every 3000ms (3 seconds)
                 setInterval(rotateAP, 3000);
             }
         });
@@ -330,16 +318,16 @@ DARK_TEMPLATE = """
             </div>
         </div>
 
-        <div class="scroller-wrapper">
+        <div class="scroller-wrapper" {% if not stats.down_aps %} style="background-color: #4DE81A; border-color: #4DE81A;" {% endif %}>
             {% if stats.down_aps %}
                 <div id="ap-alert-text"></div>
             {% else %}
-                <div id="ap-alert-text" style="color: black;">All Access Points are Online ✓</div>
+                <div id="ap-alert-text" style="color: white;">
+                    All Access Points are Online ✓
+                </div>
             {% endif %}
         </div>
-
-    </div>
-</body>
+    </div> </body>
 </html>
 """
 
@@ -357,15 +345,23 @@ def index():
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
+    error_msg = ""
     if request.method == 'POST':
         if pyotp.TOTP(MFA_SECRET).verify(request.form.get('code').strip()):
             session.permanent = True # Cookie survives browser refreshes
             session['auth'] = True
             return redirect(url_for('index'))
-    return '<body style="background:#0b0e14;color:white;text-align:center;padding-top:100px;font-family:sans-serif;">' \
-           '<h2>🛡️ Meraki Dashboard | TV Mode Access</h2><form method="post"><p>Enter MFA Code:</p>' \
-           '<input name="code" type="text" style="font-size:30px;width:160px;text-align:center;background:#161b22;color:white;border:1px solid #30363d;" autofocus><br><br>' \
-           '<button type="submit" style="padding:10px 25px;font-weight:bold;cursor:pointer;background:#2ea043;color:white;border:none;border-radius:5px;">Unlock Monitor</button></form></body>'
+        else:
+            error_msg = "<p style='color:#ff0000; font-weight:bold;'>Invalid Code. Please try again.</p>"
+            
+    return f'''<body style="background:#0b0e14;color:white;text-align:center;padding-top:100px;font-family:sans-serif;">
+           <h2>🛡️ Meraki Dashboard | TV Mode Access</h2>
+           <form method="post">
+           <p>Enter MFA Code:</p>
+           {error_msg}
+           <input name="code" type="text" autocomplete="off" style="font-size:30px;width:160px;text-align:center;background:#161b22;color:white;border:1px solid #30363d;" autofocus><br><br>
+           <button type="submit" style="padding:10px 25px;font-weight:bold;cursor:pointer;background:#2ea043;color:white;border:none;border-radius:5px;">Unlock Monitor</button>
+           </form></body>'''
 
 if __name__ == '__main__':
     if not os.environ.get("WERKZEUG_RUN_MAIN"):
