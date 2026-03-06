@@ -192,7 +192,7 @@ DARK_TEMPLATE = """
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta http-equiv="refresh" content="1800"> 
+    <meta http-equiv="refresh" content="600"> 
     <title>Meraki Monitor | TV Edition</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
@@ -371,7 +371,7 @@ DARK_TEMPLATE = """
 </head>
 <body onload="updateTime()">
     <div class="header">
-        <div><h1>Meraki Dashboard | Live Monitor</h1><div style="color:#95a5a6">Ramon Solis © 2026 | Auto-Refresh Every 30 Minutes</div></div>
+        <div><h1>Meraki Dashboard | Live Monitor</h1><div style="color:#95a5a6">Ramon Solis © 2026 | Auto-Refresh Every 10 Minutes</div></div>
         <div class="header-clock-container"><div id="live-date"></div><div id="live-clock">00:00:00 AM</div></div>
         <div class="status-pill"><div class="glow-dot"></div><span style="color:#2ea043;font-weight:bold;font-size:1.3em;">ON</span></div>
     </div>
@@ -380,7 +380,7 @@ DARK_TEMPLATE = """
         <div class="card">
             
             <div class="group">
-                <div class="up-dn-labels"><span>ONLINE</span><span>OFFLINE</span></div>
+                <div class="up-dn-labels"><span>ONLINE</span><span>DOWN</span></div>
                 <div class="box-container">
                     <div class="stat-box bg-up">{{ stats.ap.up }}</div>
                     <div class="stat-box bg-dn">{{ stats.ap.dn }}</div>
@@ -458,7 +458,7 @@ DARK_TEMPLATE = """
                 <div id="ap-alert-text"></div>
             {% else %}
                 <div id="ap-alert-text" style="color: #4DE81A;">
-                    All Access Points are ONLINE and negotiating at > 1 Gbps+ ✓
+                    All Access Points are ONLINE and Negotiating at > 1 Gbps+ ✓
                 </div>
             {% endif %}
         </div>
