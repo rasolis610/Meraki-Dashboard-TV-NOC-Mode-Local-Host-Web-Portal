@@ -7,6 +7,7 @@ import pyotp
 import meraki
 import webbrowser
 import qrcode
+import re
 from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, render_template_string, request, redirect, url_for, session
 from datetime import datetime, timedelta
@@ -87,15 +88,59 @@ def format_k(num):
         return f"{int(val)}K" if val.is_integer() else f"{val}K"
     return "{:,}".format(num)
 
+def format_usage(kb_val):
+    if not kb_val: return "0 GB"
+    try:
+        kb = float(kb_val)
+        mb = kb / 1024
+        gb = mb / 1024
+        tb = gb / 1024
+        if tb >= 1: return f"{tb:.2f} TB"
+        if gb >= 1: return f"{gb:.2f} GB"
+        if mb >= 1: return f"{mb:.2f} MB"
+        return f"{kb:.2f} KB"
+    except:
+        return "0 GB"
+
+def parse_speed_value(p):
+    raw = p.get('linkNegotiation', {}).get('speed') or p.get('speed')
+    if raw is None: return 0
+    if isinstance(raw, (int, float)): return int(raw)
+    
+    s = str(raw).lower()
+    match = re.search(r'\b(\d+)\b', s)
+    if match:
+        val = int(match.group(1))
+        if 'g' in s: val *= 1000
+        return val
+    return 0
+
+def extract_speed(ports):
+    # Always prefer eth0 as the primary uplink if present
+    for p in ports:
+        if p.get('name') == 'eth0':
+            val = parse_speed_value(p)
+            if val > 0: return val
+            
+    # Fallback to the first port that returns a valid speed
+    for p in ports:
+        val = parse_speed_value(p)
+        if val > 0: return val
+    return 0
+
 # --- Optimized Data Logic ---
 def get_monitor_stats():
     try:
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            f_clients = executor.submit(dashboard.organizations.getOrganizationClientsOverview, ORG_ID)
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            f_clients = executor.submit(dashboard.organizations.getOrganizationClientsOverview, ORG_ID, timespan=28800)
             f_devs = executor.submit(dashboard.organizations.getOrganizationDevicesStatuses, ORG_ID, total_pages='all')
             f_nets = executor.submit(dashboard.organizations.getOrganizationNetworks, ORG_ID, total_pages='all')
             f_eth = executor.submit(dashboard.wireless.getOrganizationWirelessDevicesEthernetStatuses, ORG_ID, total_pages='all')
             f_ssids = executor.submit(dashboard.organizations.getOrganizationSummaryTopSsidsByUsage, ORG_ID, timespan=28800)
+            
+            f_top_clients = executor.submit(dashboard.organizations.getOrganizationSummaryTopClientsByUsage, ORG_ID, timespan=28800)
+            f_top_devices = executor.submit(dashboard.organizations.getOrganizationSummaryTopDevicesByUsage, ORG_ID, timespan=28800)
+            f_top_models = executor.submit(dashboard.organizations.getOrganizationSummaryTopDevicesModelsByUsage, ORG_ID, timespan=28800)
             
             client_overview = f_clients.result()
             devs = f_devs.result()
@@ -104,17 +149,19 @@ def get_monitor_stats():
             try: eth_statuses = f_eth.result()
             except Exception: eth_statuses = []
 
+        # Map speeds using the new ultra-resilient parser
         ap_speeds = {}
         for ap in eth_statuses:
             serial = ap.get('serial')
-            ports = ap.get('ports', [])
-            for p in ports:
-                if p.get('name') == 'eth0':
-                    ap_speeds[serial] = p.get('linkNegotiation', {}).get('speed', 0)
+            speed = extract_speed(ap.get('ports', []))
+            if speed > 0:
+                ap_speeds[serial] = speed
 
         stats = {
-            'ap': {'up': 0, 'dn': 0}, 'sw': {'up': 0, 'dn': 0},
-            'cam': {'up': 0, 'dn': 0}, 'sen': {'up': 0, 'dn': 0},
+            'ap': {'online': 0, 'offline': 0, 'alerting': 0, 'repeater': 0}, 
+            'sw': {'up': 0, 'dn': 0},
+            'cam': {'up': 0, 'dn': 0}, 
+            'sen': {'up': 0, 'dn': 0},
             'nets': len(nets), 
             'clients': client_overview.get('counts', {}).get('total', 0), 
             'slow_ap_count': 0,
@@ -122,8 +169,24 @@ def get_monitor_stats():
             'ssid_list': [],
             'wireless_total': 0,
             'wireless_total_str': "0",
-            'clients_str': "0"
+            'clients_str': "0",
+            'top_clients': [],
+            'top_ap_clients': [],
+            'top_ap_usage': [],
+            'top_models': [],
+            'total_data': "0 GB"  
         }
+
+        # Dynamically pull total data transferred
+        try:
+            total_usage_kb = client_overview.get('usage', {}).get('total', 0)
+            if total_usage_kb:
+                stats['total_data'] = format_usage(total_usage_kb)
+            else:
+                fallback_kb = sum(m.get('usage', {}).get('total', 0) for m in f_top_models.result())
+                stats['total_data'] = format_usage(fallback_kb) if fallback_kb > 0 else "0 GB"
+        except Exception:
+            pass
 
         try:
             ssid_usage = f_ssids.result()
@@ -153,33 +216,92 @@ def get_monitor_stats():
         stats['wireless_total_str'] = format_k(stats['wireless_total'])
         stats['clients_str'] = format_k(stats['clients'])
 
+        try: 
+            top_clients_data = f_top_clients.result()
+            for c in top_clients_data[:10]:
+                usage = c.get('usage', {}).get('total', 0)
+                stats['top_clients'].append({'name': c.get('name') or c.get('mac') or 'Unknown', 'usage': format_usage(usage)})
+        except Exception: pass
+
+        try: 
+            top_devices_data = f_top_devices.result()
+            top_by_clients = sorted(top_devices_data, key=lambda x: x.get('clients', {}).get('counts', {}).get('total', 0), reverse=True)
+            for d in top_by_clients[:10]:
+                stats['top_ap_clients'].append({'name': d.get('name') or d.get('mac') or 'Unknown', 'clients': d.get('clients', {}).get('counts', {}).get('total', 0)})
+            
+            top_by_usage = sorted(top_devices_data, key=lambda x: x.get('usage', {}).get('total', 0), reverse=True)
+            for d in top_by_usage[:10]:
+                stats['top_ap_usage'].append({'name': d.get('name') or d.get('mac') or 'Unknown', 'usage': format_usage(d.get('usage', {}).get('total', 0))})
+        except Exception: pass
+
+        model_inventory = {}
+        for d in devs:
+            mod = d.get('model', 'Unknown')
+            if mod not in model_inventory:
+                model_inventory[mod] = {'count': 0, 'usage': 0}
+            model_inventory[mod]['count'] += 1
+            
+        try:
+            for m in f_top_models.result():
+                mod = m.get('model', 'Unknown')
+                if mod in model_inventory:
+                    model_inventory[mod]['usage'] = m.get('usage', {}).get('total', 0)
+        except Exception: pass
+
+        sorted_models = sorted(model_inventory.items(), key=lambda x: x[1]['count'], reverse=True)
+        for mod, data in sorted_models[:10]:
+            stats['top_models'].append({
+                'model': mod,
+                'count': data['count'],
+                'usage': format_usage(data['usage'])
+            })
+
+        # Process Device Statuses & Scroller Alerts
         for d in devs:
             status = d.get('status', '').lower()
             ptype = d.get('productType', '')
-            is_up = 1 if status == 'online' else 0
-            is_dn = 1 if status == 'offline' else 0
+            name_or_mac = d.get('name') or d.get('mac')
+            serial = d.get('serial')
+
+            # Global Scroller Alerts
+            if status == 'offline':
+                stats['scroller_alerts'].append(f"🔴 OFFLINE {ptype.upper()}: {name_or_mac} is currently DOWN")
+            elif status == 'alerting':
+                stats['scroller_alerts'].append(f"⚠️ ALERTING {ptype.upper()}: {name_or_mac} needs attention")
 
             if ptype == 'wireless':
-                stats['ap']['up'] += is_up
-                stats['ap']['dn'] += is_dn
-                ap_name = d.get('name') or d.get('mac')
-                ap_serial = d.get('serial')
+                if status == 'offline': 
+                    stats['ap']['offline'] += 1
+                else:
+                    speed = ap_speeds.get(serial)
+                    is_mesh = (speed is None or speed == 0)
 
-                # Check if offline
-                if status == 'offline':
-                    stats['scroller_alerts'].append(f"🔴 OFFLINE AP: {ap_name} is currently DOWN")
-                
-                # Check if online but slow
-                elif status == 'online':
-                    speed = ap_speeds.get(ap_serial)
+                    # Tally mutually exclusive top row UI boxes
+                    if status == 'alerting':
+                        stats['ap']['alerting'] += 1
+                    elif is_mesh:
+                        stats['ap']['repeater'] += 1
+                    else:
+                        stats['ap']['online'] += 1
+                    
+                    # Uncoupled scroller alerts for Mesh and Slow Speeds
+                    if is_mesh:
+                        stats['scroller_alerts'].append(f"📡 MESH AP: {name_or_mac} is operating as a Repeater")
+                        
                     if speed is not None and 0 < speed < 1000:
-                        upstream = get_upstream_port(ap_serial) if stats['slow_ap_count'] < 5 else "(Fetch skipped - high volume)"
-                        stats['scroller_alerts'].append(f"⚠️ SLOW AP: {ap_name} is running at {speed} Mbps! ({upstream})")
+                        upstream = get_upstream_port(serial) if stats['slow_ap_count'] < 10 else "(Fetch skipped)"
+                        stats['scroller_alerts'].append(f"⚠️ SLOW AP: {name_or_mac} is running at {speed} Mbps! ({upstream})")
                         stats['slow_ap_count'] += 1
 
-            elif ptype == 'switch': stats['sw']['up'] += is_up; stats['sw']['dn'] += is_dn
-            elif ptype == 'camera': stats['cam']['up'] += is_up; stats['cam']['dn'] += is_dn
-            elif ptype == 'sensor': stats['sen']['up'] += is_up; stats['sen']['dn'] += is_dn
+            elif ptype == 'switch': 
+                stats['sw']['up'] += (1 if status in ['online', 'alerting'] else 0)
+                stats['sw']['dn'] += (1 if status == 'offline' else 0)
+            elif ptype == 'camera': 
+                stats['cam']['up'] += (1 if status in ['online', 'alerting'] else 0)
+                stats['cam']['dn'] += (1 if status == 'offline' else 0)
+            elif ptype == 'sensor': 
+                stats['sen']['up'] += (1 if status in ['online', 'alerting'] else 0)
+                stats['sen']['dn'] += (1 if status == 'offline' else 0)
 
         return stats
     except Exception as e:
@@ -196,22 +318,24 @@ DARK_TEMPLATE = """
     <title>Meraki Monitor | TV Edition</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
-        body { background-color: #0b0e14; color: #e1e1e1; font-family: 'Segoe UI', sans-serif; margin: 0; overflow: hidden; }
-        .header { background: #1c2331; padding: 15px 40px; border-bottom: 3px solid #2980b9; display: flex; justify-content: space-between; align-items: center; }
-        h1 { margin: 0; color: #3498db; font-size: 2.2em; text-transform: uppercase; letter-spacing: 2px; }
+        body { background-color: #0b0e14; color: #e1e1e1; font-family: 'Segoe UI', sans-serif; margin: 0; padding: 0; overflow: hidden; height: 100vh; display: flex; flex-direction: column; }
+        
+        .header { background: #1c2331; padding: 10px 40px; border-bottom: 3px solid #2980b9; display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; }
+        h1 { margin: 0; color: #3498db; font-size: 2em; text-transform: uppercase; letter-spacing: 2px; }
+        .header-sub { color: #95a5a6; font-size: 0.9em; }
         
         .header-clock-container { text-align: right; margin-right: 20px; display: flex; flex-direction: column; justify-content: center; }
-        #live-date { color: #95a5a6; font-size: 1.1em; font-weight: bold; }
-        #live-clock { color: #f1c40f; font-size: 1.8em; font-family: 'Consolas', monospace; font-weight: bold; }
+        #live-date { color: #95a5a6; font-size: 1em; font-weight: bold; }
+        #live-clock { color: #f1c40f; font-size: 1.6em; font-family: 'Consolas', monospace; font-weight: bold; }
         
         .status-pill { background: #000; border: 2px solid #2ea043; border-radius: 50px; padding: 5px 25px; display: flex; align-items: center; gap: 12px; box-shadow: 0 0 15px rgba(46, 160, 67, 0.4); }
         .glow-dot { width: 14px; height: 14px; background-color: #2ea043; border-radius: 50%; box-shadow: 0 0 10px #2ea043; animation: pulse 2s infinite; }
         @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.3; } 100% { opacity: 1; } }
 
-        /* General Box Animations - Smooth 5s Pulse */
+        /* General Box Animations */
         .card, .sum-box {
             background: #161b22;
-            border-radius: 15px;
+            border-radius: 12px;
             border: 2px solid rgba(0, 174, 239, 0.3);
             animation: glow-pulse-blue 5s ease-in-out infinite;
             display: flex;
@@ -221,7 +345,7 @@ DARK_TEMPLATE = """
 
         @keyframes glow-pulse-blue {
             0% { box-shadow: 0 0 5px rgba(0, 174, 239, 0.1); border-color: rgba(0, 174, 239, 0.3); }
-            50% { box-shadow: 0 0 25px rgba(0, 174, 239, 0.7); border-color: rgba(0, 174, 239, 0.9); }
+            50% { box-shadow: 0 0 20px rgba(0, 174, 239, 0.6); border-color: rgba(0, 174, 239, 0.8); }
             100% { box-shadow: 0 0 5px rgba(0, 174, 239, 0.1); border-color: rgba(0, 174, 239, 0.3); }
         }
 
@@ -230,89 +354,62 @@ DARK_TEMPLATE = """
         }
         @keyframes glow-pulse-red {
             0% { box-shadow: 0 0 5px rgba(255, 0, 0, 0.2); border-color: rgba(255, 0, 0, 0.3); }
-            50% { box-shadow: 0 0 35px rgba(255, 0, 0, 0.9); border-color: rgba(255, 0, 0, 1); }
+            50% { box-shadow: 0 0 30px rgba(255, 0, 0, 0.9); border-color: rgba(255, 0, 0, 1); }
             100% { box-shadow: 0 0 5px rgba(255, 0, 0, 0.2); border-color: rgba(255, 0, 0, 0.3); }
         }
 
-        .container { max-width: 1450px; margin: 30px auto; padding: 0 20px; }
-        .card { height: 220px; margin-bottom: 40px; }
-        .group { text-align: center; }
-        .up-dn-labels { display: flex; justify-content: center; gap: 35px; font-weight: bold; color: #8b949e; margin-bottom: 8px; }
-        .box-container { display: flex; gap: 15px; }
-        .stat-box { width: 110px; height: 110px; line-height: 110px; font-size: 36px; font-weight: bold; border: 3px solid #000; border-radius: 10px; }
-        .bg-up { background-color: #2ea043; color: white; } .bg-dn { background-color: #ff0000; color: white; }
-        
-        .summary-wrap { display: flex; justify-content: space-between; gap: 20px; width: 100%; box-sizing: border-box; }
-        .sum-box { height: 240px; flex-direction: column; }
-        .sum-val { font-size: 55px; font-weight: bold; color: #ffffff; margin: 0; }
-        .sum-label { color: #8b949e; font-size: 20px; font-weight: bold; margin-top: 10px; }
+        .container { flex-grow: 1; max-width: 100%; margin: 0; padding: 15px; display: flex; flex-direction: column; gap: 15px; width: 100%; box-sizing: border-box; }
+        .summary-wrap { display: flex; gap: 15px; width: 100%; box-sizing: border-box; }
 
-        .donut-static {
-            width: 140px;
-            height: 140px;
-            border-radius: 50%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            margin-bottom: 5px;
-            box-sizing: border-box;
-        }
+        /* Split Top Containers Layout */
+        .group { display: flex; flex-direction: column; justify-content: space-between; align-items: center; height: 100%; width: 100%; }
+        .up-dn-labels { display: flex; width: 100%; gap: 15px; font-weight: bold; color: #8b949e; margin-bottom: 8px; font-size: 15px; }
+        .up-dn-labels span { flex: 1; text-align: center; } 
+        .box-container { display: flex; width: 100%; flex-grow: 1; gap: 15px; align-items: center; justify-content: center; }
+        .stat-box { flex: 1; height: 80%; display: flex; align-items: center; justify-content: center; font-size: 56px; font-weight: bold; border: 4px solid #000; border-radius: 12px; }
+        
+        .bg-up { background-color: #2ea043; color: white; } 
+        .bg-dn { background-color: #ff0000; color: white; }
+        
+        /* Middle Row */
+        .mid-row { flex: 1.2; margin: 0; }
+        .mid-row .sum-box { height: 100%; flex-direction: column; }
+        .sum-val { font-size: 48px; font-weight: bold; color: #ffffff; margin: 0; }
+
+        .donut-static { width: 150px; height: 150px; border-radius: 50%; display: flex; align-items: center; justify-content: center; margin-bottom: 5px; box-sizing: border-box; }
         .donut-aqua { border: 12px solid #2ac9c5; }
         .donut-yellow { border: 12px solid #f1c40f; }
-        .donut-red-flash {
-            border: 12px solid #ff0000;
-            animation: pulse-red-donut 1.5s infinite;
-        }
+        .donut-green { border: 12px solid #2ea043; }
+        .donut-red-flash { border: 12px solid #ff0000; animation: pulse-red-donut 1.5s infinite; }
         
         @keyframes pulse-red-donut {
             0% { box-shadow: 0 0 10px rgba(255,0,0,0.5), inset 0 0 10px rgba(255,0,0,0.5); }
-            50% { box-shadow: 0 0 35px rgba(255,0,0,1), inset 0 0 35px rgba(255,0,0,1); }
+            50% { box-shadow: 0 0 30px rgba(255,0,0,1), inset 0 0 30px rgba(255,0,0,1); }
             100% { box-shadow: 0 0 10px rgba(255,0,0,0.5), inset 0 0 10px rgba(255,0,0,0.5); }
         }
 
-        /* Scroller Wrapper - Contextual Glow */
-        .scroller-wrapper {
-            margin: 40px auto;
-            width: 70%;
-            height: 40px;
-            border-radius: 6px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            text-align: center;
-            background: #161b22;
-        }
+        /* Bottom Row Gadgets */
+        .bot-row { flex: 1.8; margin: 0; }
+        .bot-row .sum-box { height: 100%; padding: 15px; box-sizing: border-box; justify-content: flex-start; flex-direction: column; }
+        .gadget-title { text-align: center; color: #e1e1e1; font-weight: bold; margin-bottom: 8px; font-size: 14px; }
+        .table-container { width: 100%; font-size: 11px; color: #e1e1e1; text-align: left; border-collapse: collapse; }
+        .table-container th { color: #58a6ff; font-weight: normal; padding-bottom: 4px; border-bottom: 1px solid #30363d; }
+        .table-container td { padding: 3px 0; border-bottom: 1px solid #21262d; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 130px; }
+        .table-container td.right, .table-container th.right { text-align: right; }
 
-        .scroller-ok { 
-            border: 2px solid rgba(46, 160, 67, 0.3);
-            animation: glow-pulse-green 5s ease-in-out infinite; 
-        }
+        /* Scroller */
+        .scroller-wrapper { margin: 0 auto; width: 70%; height: 40px; border-radius: 6px; display: flex; align-items: center; justify-content: center; text-align: center; background: #161b22; flex-shrink: 0; }
+        .scroller-ok { border: 2px solid rgba(46, 160, 67, 0.3); animation: glow-pulse-green 5s ease-in-out infinite; }
         @keyframes glow-pulse-green {
             0% { box-shadow: 0 0 5px rgba(46, 160, 67, 0.2); border-color: rgba(46, 160, 67, 0.3); }
-            50% { box-shadow: 0 0 25px rgba(46, 160, 67, 0.8); border-color: rgba(46, 160, 67, 1); }
+            50% { box-shadow: 0 0 20px rgba(46, 160, 67, 0.8); border-color: rgba(46, 160, 67, 1); }
             100% { box-shadow: 0 0 5px rgba(46, 160, 67, 0.2); border-color: rgba(46, 160, 67, 0.3); }
         }
 
-        .scroller-alert { 
-            border: 2px solid rgba(255, 0, 0, 0.3);
-            animation: glow-pulse-red 1.5s ease-in-out infinite; 
-        }
-
-        #ap-alert-text { 
-            font-size: 22px; 
-            font-weight: bold; 
-            color: yellow; 
-            white-space: nowrap; 
-        }
-        
+        .scroller-alert { border: 2px solid rgba(255, 0, 0, 0.3); animation: glow-pulse-red 1.5s ease-in-out infinite; }
+        #ap-alert-text { font-size: 20px; font-weight: bold; color: yellow; white-space: nowrap; }
         .flash-effect { animation: text-flash 0.6s ease-in-out; }
-        @keyframes text-flash {
-            0%   { opacity: 1; color: #FFFFFF; }
-            25%  { opacity: 0; color: #FFFFFF; }
-            50%  { opacity: 1; color: #FFFFFF; }
-            75%  { opacity: 0; color: #FFFFFF; }
-            100% { opacity: 1; color: yellow; }
-        }
+        @keyframes text-flash { 0% { opacity: 1; color: #FFFFFF; } 25% { opacity: 0; color: #FFFFFF; } 50% { opacity: 1; color: #FFFFFF; } 75% { opacity: 0; color: #FFFFFF; } 100% { opacity: 1; color: yellow; } }
     </style>
     <script>
         function updateTime() {
@@ -331,9 +428,10 @@ DARK_TEMPLATE = """
                     alertTextElement.classList.remove('flash-effect');
                     void alertTextElement.offsetWidth; 
                     alertTextElement.innerText = scrollerAlerts[currentIndex];
-                    // Make text red if it's an offline alert, otherwise keep it yellow
                     if (scrollerAlerts[currentIndex].includes("OFFLINE")) {
                         alertTextElement.style.color = "#ff4a4a";
+                    } else if (scrollerAlerts[currentIndex].includes("MESH")) {
+                        alertTextElement.style.color = "#a8d5ff";
                     } else {
                         alertTextElement.style.color = "yellow";
                     }
@@ -351,19 +449,9 @@ DARK_TEMPLATE = """
                     type: 'doughnut',
                     data: {
                         labels: ssidData.map(d => d.name),
-                        datasets: [{
-                            data: ssidData.map(d => d.count),
-                            backgroundColor: ssidData.map(d => d.color),
-                            borderWidth: 0,
-                            cutout: '75%'
-                        }]
+                        datasets: [{ data: ssidData.map(d => d.count), backgroundColor: ssidData.map(d => d.color), borderWidth: 0, cutout: '75%' }]
                     },
-                    options: {
-                        responsive: true,
-                        maintainAspectRatio: false,
-                        plugins: { legend: { display: false }, tooltip: { enabled: true } },
-                        animation: { duration: 1500, animateScale: true }
-                    }
+                    options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false }, tooltip: { enabled: true } }, animation: { duration: 1500, animateScale: true } }
                 });
             }
         });
@@ -371,64 +459,79 @@ DARK_TEMPLATE = """
 </head>
 <body onload="updateTime()">
     <div class="header">
-        <div><h1>Meraki Dashboard | Live Monitor</h1><div style="color:#95a5a6">Ramon Solis © 2026 | Auto-Refresh Every 10 Minutes</div></div>
+        <div><h1>Meraki Dashboard | Live Monitor</h1><div class="header-sub">Ramon Solis © 2026 | Auto-Refresh Every 10 Minutes</div></div>
         <div class="header-clock-container"><div id="live-date"></div><div id="live-clock">00:00:00 AM</div></div>
         <div class="status-pill"><div class="glow-dot"></div><span style="color:#2ea043;font-weight:bold;font-size:1.3em;">ON</span></div>
     </div>
     
     <div class="container">
-        <div class="card">
+        
+        <div style="display: flex; gap: 5px; width: 100%; box-sizing: border-box; flex: 1;">
             
-            <div class="group">
-                <div class="up-dn-labels"><span>ONLINE</span><span>DOWN</span></div>
-                <div class="box-container">
-                    <div class="stat-box bg-up">{{ stats.ap.up }}</div>
-                    <div class="stat-box bg-dn">{{ stats.ap.dn }}</div>
+            <div class="card" style="flex: 1.6; margin: 0; padding: 15px 10px;">
+                <div class="group">
+                    <div class="up-dn-labels" style="font-size: 13px;">
+                        <span style="color: #2ea043;">ONLINE</span>
+                        <span style="color: #ff0000;">DOWN</span>
+                        <span style="color: #f1c40f;">ALERT</span>
+                        <span style="color: #95a5a6;">MESH</span>
+                    </div>
+                    <div class="box-container" style="gap: 8px;">
+                        <div class="stat-box bg-up" style="font-size: 40px; height: 90px;">{{ stats.ap.online }}</div>
+                        <div class="stat-box bg-dn" style="font-size: 40px; height: 90px;">{{ stats.ap.offline }}</div>
+                        <div class="stat-box" style="font-size: 40px; height: 90px; background-color: #f1c40f; color: #000; border-color: #000;">{{ stats.ap.alerting }}</div>
+                        <div class="stat-box" style="font-size: 40px; height: 90px; background-color: #95a5a6; color: #fff; border-color: #000;">{{ stats.ap.repeater }}</div>
+                    </div>
+                    <div style="margin-top:10px;font-weight:bold;font-size:1.1em;color:#58a6ff;">Access Points</div>
                 </div>
-                <div style="margin-top:15px;font-weight:bold;font-size:1.2em;color:#58a6ff;">Access Points</div>
             </div>
 
             {% for label, d in [('Switches', stats.sw), ('Cameras', stats.cam), ('Sensors', stats.sen)] %}
-            <div class="group">
-                <div class="up-dn-labels"><span>UP</span><span>DOWN</span></div>
-                <div class="box-container">
-                    <div class="stat-box bg-up">{{ d.up }}</div>
-                    <div class="stat-box bg-dn">{{ d.dn }}</div>
+            <div class="card" style="flex: 1; margin: 0; padding: 15px 10px;">
+                <div class="group">
+                    <div class="up-dn-labels"><span>UP</span><span>DOWN</span></div>
+                    <div class="box-container">
+                        <div class="stat-box bg-up" style="font-size: 40px; height: 90px;">{{ d.up }}</div>
+                        <div class="stat-box bg-dn" style="font-size: 40px; height: 90px;">{{ d.dn }}</div>
+                    </div>
+                    <div style="margin-top:10px;font-weight:bold;font-size:1.1em;color:#58a6ff;">{{ label }}</div>
                 </div>
-                <div style="margin-top:15px;font-weight:bold;font-size:1.2em;color:#58a6ff;">{{ label }}</div>
             </div>
             {% endfor %}
 
         </div>
 
-        <div class="summary-wrap">
-            <div class="sum-box" style="flex: 3; justify-content: center;">
-                <div class="donut-static donut-aqua">
-                    <div class="sum-val">{{ stats.nets }}</div>
+        <div class="summary-wrap mid-row">
+            <div class="sum-box" style="flex: 2; padding: 15px; box-sizing: border-box; justify-content: flex-start; align-items: center;">
+                <div style="width: 100%; text-align: left; margin-bottom: 10px;">
+                    <span style="color: #ffffff; font-weight: bold; font-size: 14px;">Total Meraki Networks</span>
                 </div>
-                <div class="sum-label">Total Meraki Networks</div>
+                <div style="display: flex; flex-grow: 1; align-items: center; justify-content: center;">
+                    <div class="donut-static donut-aqua">
+                        <div class="sum-val" style="font-size: 60px;">{{ stats.nets }}</div>
+                    </div>
+                </div>
             </div>
 
-            <div class="sum-box" style="flex: 4; padding: 20px; box-sizing: border-box; justify-content: flex-start; align-items: flex-start;">
-                <div style="width: 100%; display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
-                    <span style="color: #e1e1e1; font-weight: bold; font-size: 16px;">Wireless Client by SSID | Last 8 Hours</span>
+            <div class="sum-box" style="flex: 4; padding: 15px; box-sizing: border-box; justify-content: flex-start; align-items: flex-start;">
+                <div style="width: 100%; display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                    <span style="color: #ffffff; font-weight: bold; font-size: 14px;">Wireless Client by SSID | Last 8 Hours</span>
                     <span style="color: #8b949e; cursor: pointer;">⋮</span>
                 </div>
-                
                 {% if stats.ssid_list %}
-                <div style="display: flex; align-items: center; justify-content: space-evenly; width: 100%;">
+                <div style="display: flex; align-items: center; justify-content: space-evenly; width: 100%; height: 100%;">
                     <div style="position: relative; width: 150px; height: 150px;">
                         <canvas id="ssidChart"></canvas>
-                        <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -45%); font-size: 36px; font-weight: bold; color: white;">
+                        <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -45%); font-size: 30px; font-weight: bold; color: white;">
                             {{ stats.wireless_total_str }}
                         </div>
                     </div>
-                    <div style="display: flex; flex-direction: column; gap: 10px; width: 150px;">
+                    <div style="display: flex; flex-direction: column; gap: 8px; width: 140px;">
                         {% for ssid in stats.ssid_list %}
-                        <div style="display: flex; align-items: center; justify-content: space-between; font-size: 14px; font-weight: bold; color: #e1e1e1;">
-                            <div style="display: flex; align-items: center; gap: 8px;">
+                        <div style="display: flex; align-items: center; justify-content: space-between; font-size: 12px; font-weight: bold; color: #e1e1e1;">
+                            <div style="display: flex; align-items: center; gap: 6px;">
                                 <div style="width: 10px; height: 10px; border-radius: 50%; background-color: {{ ssid.color }};"></div>
-                                <span style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 90px;" title="{{ ssid.name }}">{{ ssid.name }}</span>
+                                <span style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 85px;" title="{{ ssid.name }}">{{ ssid.name }}</span>
                             </div>
                             <span>{{ "{:,}".format(ssid.count) }}</span>
                         </div>
@@ -436,7 +539,7 @@ DARK_TEMPLATE = """
                     </div>
                 </div>
                 {% else %}
-                <div style="display: flex; align-items: center; justify-content: center; height: 100%; width: 100%; color: #8b949e; font-size: 18px;">
+                <div style="display: flex; align-items: center; justify-content: center; height: 100%; width: 100%; color: #8b949e; font-size: 16px;">
                     <div style="text-align: center;">
                         <div style="font-size: 40px; color: white; margin-bottom: 5px;">{{ stats.clients_str }}</div>
                         Total Clients<br>(SSID Breakdown Unavailable)
@@ -445,20 +548,75 @@ DARK_TEMPLATE = """
                 {% endif %}
             </div>
             
-            <div class="sum-box {% if stats.slow_ap_count > 0 %} flashing-box {% endif %}" style="flex: 3; justify-content: center;">
-                <div class="donut-static {% if stats.slow_ap_count > 0 %} donut-red-flash {% else %} donut-yellow {% endif %}">
-                    <div style="font-size: 55px; font-weight: bold; color: white;">{{ stats.slow_ap_count }}</div>
+            <div class="sum-box {% if stats.slow_ap_count > 0 %} flashing-box {% endif %}" style="flex: 3; padding: 15px; box-sizing: border-box; justify-content: flex-start; align-items: center;">
+                <div style="width: 100%; text-align: left; margin-bottom: 10px;">
+                    <span style="color: #ffffff; font-weight: bold; font-size: 14px;">AP Running under < 1 Gbps Speed</span>
                 </div>
-                <div class="sum-label">AP Running under < 1 Gbps Speed</div>
+                <div style="display: flex; flex-grow: 1; align-items: center; justify-content: center;">
+                    <div class="donut-static {% if stats.slow_ap_count > 0 %} donut-red-flash {% else %} donut-yellow {% endif %}">
+                        <div style="font-size: 60px; font-weight: bold; color: white;">{{ stats.slow_ap_count }}</div>
+                    </div>
+                </div>
             </div>
         </div>
 
-        <div class="scroller-wrapper {% if stats.scroller_alerts %} scroller-alert {% else %} scroller-ok {% endif %}">
+        <div class="summary-wrap bot-row">
+            <div class="sum-box" style="flex: 1;">
+                <div class="gadget-title">Top 10 Clients by Data Usage</div>
+                <table class="table-container">
+                    <tr><th>Description</th><th class="right">Usage</th></tr>
+                    {% for c in stats.top_clients %}
+                    <tr><td title="{{ c.name }}">{{ c.name }}</td><td class="right">{{ c.usage }}</td></tr>
+                    {% endfor %}
+                </table>
+            </div>
+
+            <div class="sum-box" style="flex: 1;">
+                <div class="gadget-title">Top 10 APs by Connected Clients</div>
+                <table class="table-container">
+                    <tr><th>Name</th><th class="right"># Clients</th></tr>
+                    {% for a in stats.top_ap_clients %}
+                    <tr><td title="{{ a.name }}">{{ a.name }}</td><td class="right">{{ a.clients }}</td></tr>
+                    {% endfor %}
+                </table>
+            </div>
+
+            <div class="sum-box" style="flex: 1;">
+                <div class="gadget-title">Top 10 APs by Data Usage</div>
+                <table class="table-container">
+                    <tr><th>Name</th><th class="right">Usage</th></tr>
+                    {% for a in stats.top_ap_usage %}
+                    <tr><td title="{{ a.name }}">{{ a.name }}</td><td class="right">{{ a.usage }}</td></tr>
+                    {% endfor %}
+                </table>
+            </div>
+
+            <div class="sum-box" style="flex: 1;">
+                <div class="gadget-title">Device Models Inventory</div>
+                <table class="table-container">
+                    <tr><th>Model</th><th class="right"># Devs</th><th class="right">Usage</th></tr>
+                    {% for m in stats.top_models %}
+                    <tr><td title="{{ m.model }}">{{ m.model }}</td><td class="right">{{ m.count }}</td><td class="right">{{ m.usage }}</td></tr>
+                    {% endfor %}
+                </table>
+            </div>
+
+            <div class="sum-box" style="flex: 1; padding: 15px; box-sizing: border-box; flex-direction: column; justify-content: flex-start; align-items: center;">
+                <div class="gadget-title" style="width: 100%; text-align: center; margin-bottom: 10px;">Organization Total Data Transferred</div>
+                <div style="display: flex; flex-grow: 1; align-items: center; justify-content: center; width: 100%;">
+                    <div class="donut-static donut-green" style="width: 160px; height: 160px; border-width: 16px; margin: 0;">
+                        <div style="font-size: 32px; font-weight: bold; color: white; text-align: center;">{{ stats.total_data }}</div>
+                    </div>
+                </div>
+            </div>
+        </div> 
+
+        <div class="scroller-wrapper {% if stats.scroller_alerts %} scroller-alert {% else %} scroller-ok {% endif %}" style="margin-top: 25px; margin-bottom: 10px;">
             {% if stats.scroller_alerts %}
                 <div id="ap-alert-text"></div>
             {% else %}
                 <div id="ap-alert-text" style="color: #4DE81A;">
-                    All Access Points are ONLINE and Negotiating at > 1 Gbps+ ✓
+                    All Organization Hardware is ONLINE and Negotiating at Optimal Speeds ✓
                 </div>
             {% endif %}
         </div>
